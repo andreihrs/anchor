@@ -32,6 +32,7 @@ use solana_sdk::bpf_loader;
 use solana_sdk::bpf_loader_deprecated;
 use solana_sdk::bpf_loader_upgradeable::{self, UpgradeableLoaderState};
 use solana_sdk::commitment_config::CommitmentConfig;
+use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signature::Signer;
@@ -375,6 +376,8 @@ pub enum IdlCommand {
         program_id: Pubkey,
         #[clap(short, long)]
         filepath: String,
+        #[clap(long)]
+        priority_fee: Option<u64>,
     },
     Close {
         program_id: Pubkey,
@@ -385,6 +388,8 @@ pub enum IdlCommand {
         /// Useful for multisig execution when the local wallet keypair is not available.
         #[clap(long)]
         print_only: bool,
+        #[clap(long)]
+        priority_fee: Option<u64>,
     },
     /// Writes an IDL into a buffer account. This can be used with SetBuffer
     /// to perform an upgrade.
@@ -392,6 +397,8 @@ pub enum IdlCommand {
         program_id: Pubkey,
         #[clap(short, long)]
         filepath: String,
+        #[clap(long)]
+        priority_fee: Option<u64>,
     },
     /// Sets a new IDL buffer for the program.
     SetBuffer {
@@ -403,6 +410,8 @@ pub enum IdlCommand {
         /// Useful for multisig execution when the local wallet keypair is not available.
         #[clap(long)]
         print_only: bool,
+        #[clap(long)]
+        priority_fee: Option<u64>,
     },
     /// Upgrades the IDL to the new file. An alias for first writing and then
     /// then setting the idl buffer account.
@@ -410,6 +419,8 @@ pub enum IdlCommand {
         program_id: Pubkey,
         #[clap(short, long)]
         filepath: String,
+        #[clap(long)]
+        priority_fee: Option<u64>,
     },
     /// Sets a new authority on the IDL account.
     SetAuthority {
@@ -426,6 +437,8 @@ pub enum IdlCommand {
         /// Useful for multisig execution when the local wallet keypair is not available.
         #[clap(long)]
         print_only: bool,
+        #[clap(long)]
+        priority_fee: Option<u64>,
     },
     /// Command to remove the ability to modify the IDL account. This should
     /// likely be used in conjection with eliminating an "upgrade authority" on
@@ -433,6 +446,8 @@ pub enum IdlCommand {
     EraseAuthority {
         #[clap(short, long)]
         program_id: Pubkey,
+        #[clap(long)]
+        priority_fee: Option<u64>,
     },
     /// Outputs the authority for the IDL account.
     Authority {
@@ -2060,13 +2075,21 @@ fn idl(cfg_override: &ConfigOverride, subcmd: IdlCommand) -> Result<()> {
         IdlCommand::Init {
             program_id,
             filepath,
-        } => idl_init(cfg_override, program_id, filepath),
+            priority_fee,
+        } => idl_init(cfg_override, program_id, filepath, priority_fee),
         IdlCommand::Close {
             program_id,
             idl_address,
             print_only,
+            priority_fee,
         } => {
-            let closed_address = idl_close(cfg_override, program_id, idl_address, print_only)?;
+            let closed_address = idl_close(
+                cfg_override,
+                program_id,
+                idl_address,
+                print_only,
+                priority_fee,
+            )?;
             if !print_only {
                 println!("Idl account closed: {closed_address}");
             }
@@ -2075,8 +2098,9 @@ fn idl(cfg_override: &ConfigOverride, subcmd: IdlCommand) -> Result<()> {
         IdlCommand::WriteBuffer {
             program_id,
             filepath,
+            priority_fee,
         } => {
-            let idl_buffer = idl_write_buffer(cfg_override, program_id, filepath)?;
+            let idl_buffer = idl_write_buffer(cfg_override, program_id, filepath, priority_fee)?;
             println!("Idl buffer created: {idl_buffer}");
             Ok(())
         }
@@ -2084,18 +2108,31 @@ fn idl(cfg_override: &ConfigOverride, subcmd: IdlCommand) -> Result<()> {
             program_id,
             buffer,
             print_only,
-        } => idl_set_buffer(cfg_override, program_id, buffer, print_only).map(|_| ()),
+            priority_fee,
+        } => idl_set_buffer(cfg_override, program_id, buffer, print_only, priority_fee).map(|_| ()),
         IdlCommand::Upgrade {
             program_id,
             filepath,
-        } => idl_upgrade(cfg_override, program_id, filepath),
+            priority_fee,
+        } => idl_upgrade(cfg_override, program_id, filepath, priority_fee),
         IdlCommand::SetAuthority {
             program_id,
             address,
             new_authority,
             print_only,
-        } => idl_set_authority(cfg_override, program_id, address, new_authority, print_only),
-        IdlCommand::EraseAuthority { program_id } => idl_erase_authority(cfg_override, program_id),
+            priority_fee,
+        } => idl_set_authority(
+            cfg_override,
+            program_id,
+            address,
+            new_authority,
+            print_only,
+            priority_fee,
+        ),
+        IdlCommand::EraseAuthority {
+            program_id,
+            priority_fee,
+        } => idl_erase_authority(cfg_override, program_id, priority_fee),
         IdlCommand::Authority { program_id } => idl_authority(cfg_override, program_id),
         IdlCommand::Build {
             program_name,
@@ -2151,14 +2188,19 @@ fn get_idl_account(client: &RpcClient, idl_address: &Pubkey) -> Result<IdlAccoun
     AccountDeserialize::try_deserialize(&mut data).map_err(|e| anyhow!("{:?}", e))
 }
 
-fn idl_init(cfg_override: &ConfigOverride, program_id: Pubkey, idl_filepath: String) -> Result<()> {
+fn idl_init(
+    cfg_override: &ConfigOverride,
+    program_id: Pubkey,
+    idl_filepath: String,
+    priority_fee: Option<u64>,
+) -> Result<()> {
     with_workspace(cfg_override, |cfg| {
         let keypair = cfg.provider.wallet.to_string();
 
         let bytes = fs::read(idl_filepath)?;
         let idl: Idl = serde_json::from_reader(&*bytes)?;
 
-        let idl_address = create_idl_account(cfg, &keypair, &program_id, &idl)?;
+        let idl_address = create_idl_account(cfg, &keypair, &program_id, &idl, priority_fee)?;
 
         println!("Idl account created: {idl_address:?}");
         Ok(())
@@ -2170,10 +2212,11 @@ fn idl_close(
     program_id: Pubkey,
     idl_address: Option<Pubkey>,
     print_only: bool,
+    priority_fee: Option<u64>,
 ) -> Result<Pubkey> {
     with_workspace(cfg_override, |cfg| {
         let idl_address = idl_address.unwrap_or_else(|| IdlAccount::address(&program_id));
-        idl_close_account(cfg, &program_id, idl_address, print_only)?;
+        idl_close_account(cfg, &program_id, idl_address, print_only, priority_fee)?;
 
         Ok(idl_address)
     })
@@ -2183,6 +2226,7 @@ fn idl_write_buffer(
     cfg_override: &ConfigOverride,
     program_id: Pubkey,
     idl_filepath: String,
+    priority_fee: Option<u64>,
 ) -> Result<Pubkey> {
     with_workspace(cfg_override, |cfg| {
         let keypair = cfg.provider.wallet.to_string();
@@ -2190,8 +2234,8 @@ fn idl_write_buffer(
         let bytes = fs::read(idl_filepath)?;
         let idl: Idl = serde_json::from_reader(&*bytes)?;
 
-        let idl_buffer = create_idl_buffer(cfg, &keypair, &program_id, &idl)?;
-        idl_write(cfg, &program_id, &idl, idl_buffer)?;
+        let idl_buffer = create_idl_buffer(cfg, &keypair, &program_id, &idl, priority_fee)?;
+        idl_write(cfg, &program_id, &idl, idl_buffer, priority_fee)?;
 
         Ok(idl_buffer)
     })
@@ -2202,6 +2246,7 @@ fn idl_set_buffer(
     program_id: Pubkey,
     buffer: Pubkey,
     print_only: bool,
+    priority_fee: Option<u64>,
 ) -> Result<Pubkey> {
     with_workspace(cfg_override, |cfg| {
         let keypair = solana_sdk::signature::read_keypair_file(&cfg.provider.wallet.to_string())
@@ -2235,16 +2280,28 @@ fn idl_set_buffer(
             print_idl_instruction("SetBuffer", &ix, &idl_address)?;
         } else {
             // Build the transaction.
-            let latest_hash = client.get_latest_blockhash()?;
-            let tx = Transaction::new_signed_with_payer(
-                &[ix],
-                Some(&keypair.pubkey()),
-                &[&keypair],
-                latest_hash,
-            );
+            let instructions = prepend_compute_unit_ix(vec![ix], &client, priority_fee)?;
 
             // Send the transaction.
-            client.send_and_confirm_transaction_with_spinner(&tx)?;
+            for retry_transactions in 0..20 {
+                let latest_hash = client.get_latest_blockhash()?;
+                let tx = Transaction::new_signed_with_payer(
+                    &instructions,
+                    Some(&keypair.pubkey()),
+                    &[&keypair],
+                    latest_hash,
+                );
+
+                match client.send_and_confirm_transaction_with_spinner(&tx) {
+                    Ok(_) => break,
+                    Err(e) => {
+                        if retry_transactions == 19 {
+                            return Err(anyhow!("Error: {e}. Failed to send transaction."));
+                        }
+                        println!("Error: {e}. Retrying transaction.");
+                    }
+                }
+            }
         }
 
         Ok(idl_address)
@@ -2255,10 +2312,23 @@ fn idl_upgrade(
     cfg_override: &ConfigOverride,
     program_id: Pubkey,
     idl_filepath: String,
+    priority_fee: Option<u64>,
 ) -> Result<()> {
-    let buffer_address = idl_write_buffer(cfg_override, program_id, idl_filepath)?;
-    let idl_address = idl_set_buffer(cfg_override, program_id, buffer_address, false)?;
-    idl_close(cfg_override, program_id, Some(buffer_address), false)?;
+    let buffer_address = idl_write_buffer(cfg_override, program_id, idl_filepath, priority_fee)?;
+    let idl_address = idl_set_buffer(
+        cfg_override,
+        program_id,
+        buffer_address,
+        false,
+        priority_fee,
+    )?;
+    idl_close(
+        cfg_override,
+        program_id,
+        Some(buffer_address),
+        false,
+        priority_fee,
+    )?;
     println!("Idl account {idl_address} successfully upgraded");
     Ok(())
 }
@@ -2290,6 +2360,7 @@ fn idl_set_authority(
     address: Option<Pubkey>,
     new_authority: Pubkey,
     print_only: bool,
+    priority_fee: Option<u64>,
 ) -> Result<()> {
     with_workspace(cfg_override, |cfg| {
         // Misc.
@@ -2328,10 +2399,12 @@ fn idl_set_authority(
         if print_only {
             print_idl_instruction("SetAuthority", &ix, &idl_address)?;
         } else {
+            let instructions = prepend_compute_unit_ix(vec![ix], &client, priority_fee)?;
+
             // Send transaction.
             let latest_hash = client.get_latest_blockhash()?;
             let tx = Transaction::new_signed_with_payer(
-                &[ix],
+                &instructions,
                 Some(&keypair.pubkey()),
                 &[&keypair],
                 latest_hash,
@@ -2345,7 +2418,11 @@ fn idl_set_authority(
     })
 }
 
-fn idl_erase_authority(cfg_override: &ConfigOverride, program_id: Pubkey) -> Result<()> {
+fn idl_erase_authority(
+    cfg_override: &ConfigOverride,
+    program_id: Pubkey,
+    priority_fee: Option<u64>,
+) -> Result<()> {
     println!("Are you sure you want to erase the IDL authority: [y/n]");
 
     let stdin = std::io::stdin();
@@ -2356,7 +2433,14 @@ fn idl_erase_authority(cfg_override: &ConfigOverride, program_id: Pubkey) -> Res
         return Ok(());
     }
 
-    idl_set_authority(cfg_override, program_id, None, ERASED_AUTHORITY, false)?;
+    idl_set_authority(
+        cfg_override,
+        program_id,
+        None,
+        ERASED_AUTHORITY,
+        false,
+        priority_fee,
+    )?;
 
     Ok(())
 }
@@ -2366,6 +2450,7 @@ fn idl_close_account(
     program_id: &Pubkey,
     idl_address: Pubkey,
     print_only: bool,
+    priority_fee: Option<u64>,
 ) -> Result<()> {
     let keypair = solana_sdk::signature::read_keypair_file(&cfg.provider.wallet.to_string())
         .map_err(|_| anyhow!("Unable to read keypair file"))?;
@@ -2393,10 +2478,12 @@ fn idl_close_account(
     if print_only {
         print_idl_instruction("Close", &ix, &idl_address)?;
     } else {
+        let instructions = prepend_compute_unit_ix(vec![ix], &client, priority_fee)?;
+
         // Send transaction.
         let latest_hash = client.get_latest_blockhash()?;
         let tx = Transaction::new_signed_with_payer(
-            &[ix],
+            &instructions,
             Some(&keypair.pubkey()),
             &[&keypair],
             latest_hash,
@@ -2410,7 +2497,13 @@ fn idl_close_account(
 // Write the idl to the account buffer, chopping up the IDL into pieces
 // and sending multiple transactions in the event the IDL doesn't fit into
 // a single transaction.
-fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey) -> Result<()> {
+fn idl_write(
+    cfg: &Config,
+    program_id: &Pubkey,
+    idl: &Idl,
+    idl_address: Pubkey,
+    priority_fee: Option<u64>,
+) -> Result<()> {
     // Misc.
     let keypair = solana_sdk::signature::read_keypair_file(&cfg.provider.wallet.to_string())
         .map_err(|_| anyhow!("Unable to read keypair file"))?;
@@ -2425,9 +2518,12 @@ fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey) 
         e.finish()?
     };
 
-    const MAX_WRITE_SIZE: usize = 1000;
+    println!("Idl data length: {:?} bytes", idl_data.len());
+
+    const MAX_WRITE_SIZE: usize = 600;
     let mut offset = 0;
     while offset < idl_data.len() {
+        println!("Step {offset} ");
         // Instruction data.
         let data = {
             let start = offset;
@@ -2448,14 +2544,28 @@ fn idl_write(cfg: &Config, program_id: &Pubkey, idl: &Idl, idl_address: Pubkey) 
             data,
         };
         // Send transaction.
-        let latest_hash = client.get_latest_blockhash()?;
-        let tx = Transaction::new_signed_with_payer(
-            &[ix],
-            Some(&keypair.pubkey()),
-            &[&keypair],
-            latest_hash,
-        );
-        client.send_and_confirm_transaction_with_spinner(&tx)?;
+        let instructions = prepend_compute_unit_ix(vec![ix], &client, priority_fee)?;
+
+        for retry_transactions in 0..20 {
+            let latest_hash = client.get_latest_blockhash()?;
+            let tx = Transaction::new_signed_with_payer(
+                &instructions,
+                Some(&keypair.pubkey()),
+                &[&keypair],
+                latest_hash,
+            );
+
+            match client.send_and_confirm_transaction_with_spinner(&tx) {
+                Ok(_) => break,
+                Err(e) => {
+                    if retry_transactions == 19 {
+                        return Err(anyhow!("Error: {e}. Failed to send transaction."));
+                    }
+                    println!("Error: {e}. Retrying transaction.");
+                }
+            }
+        }
+
         offset += MAX_WRITE_SIZE;
     }
     Ok(())
@@ -3555,6 +3665,7 @@ fn create_idl_account(
     keypair_path: &str,
     program_id: &Pubkey,
     idl: &Idl,
+    priority_fee: Option<u64>,
 ) -> Result<Pubkey> {
     // Misc.
     let idl_address = IdlAccount::address(program_id);
@@ -3610,6 +3721,8 @@ fn create_idl_account(
             });
         }
         let latest_hash = client.get_latest_blockhash()?;
+        instructions = prepend_compute_unit_ix(instructions, &client, priority_fee)?;
+
         let tx = Transaction::new_signed_with_payer(
             &instructions,
             Some(&keypair.pubkey()),
@@ -3620,7 +3733,13 @@ fn create_idl_account(
     }
 
     // Write directly to the IDL account buffer.
-    idl_write(cfg, program_id, idl, IdlAccount::address(program_id))?;
+    idl_write(
+        cfg,
+        program_id,
+        idl,
+        IdlAccount::address(program_id),
+        priority_fee,
+    )?;
 
     Ok(idl_address)
 }
@@ -3630,6 +3749,7 @@ fn create_idl_buffer(
     keypair_path: &str,
     program_id: &Pubkey,
     idl: &Idl,
+    priority_fee: Option<u64>,
 ) -> Result<Pubkey> {
     let keypair = solana_sdk::signature::read_keypair_file(keypair_path)
         .map_err(|_| anyhow!("Unable to read keypair file"))?;
@@ -3667,17 +3787,30 @@ fn create_idl_buffer(
         }
     };
 
-    // Build the transaction.
-    let latest_hash = client.get_latest_blockhash()?;
-    let tx = Transaction::new_signed_with_payer(
-        &[create_account_ix, create_buffer_ix],
-        Some(&keypair.pubkey()),
-        &[&keypair, &buffer],
-        latest_hash,
-    );
+    let instructions = prepend_compute_unit_ix(
+        vec![create_account_ix, create_buffer_ix],
+        &client,
+        priority_fee,
+    )?;
 
-    // Send the transaction.
-    client.send_and_confirm_transaction_with_spinner(&tx)?;
+    for retries in 0..5 {
+        let latest_hash = client.get_latest_blockhash()?;
+        let tx = Transaction::new_signed_with_payer(
+            &instructions,
+            Some(&keypair.pubkey()),
+            &[&keypair, &buffer],
+            latest_hash,
+        );
+        match client.send_and_confirm_transaction_with_spinner(&tx) {
+            Ok(_) => break,
+            Err(err) => {
+                if retries == 4 {
+                    return Err(anyhow!("Error creating buffer account: {}", err));
+                }
+                println!("Error creating buffer account: {}. Retrying...", err);
+            }
+        }
+    }
 
     Ok(buffer.pubkey())
 }
@@ -4303,6 +4436,45 @@ fn get_node_version() -> Result<Version> {
         .unwrap()
         .trim();
     Version::parse(output).map_err(Into::into)
+}
+
+fn get_recommended_micro_lamport_fee(client: &RpcClient, priority_fee: Option<u64>) -> Result<u64> {
+    if let Some(priority_fee) = priority_fee {
+        return Ok(priority_fee);
+    }
+
+    let mut fees = client.get_recent_prioritization_fees(&[])?;
+
+    // Get the median fee from the most recent recent 150 slots' prioritization fee
+    fees.sort_unstable_by_key(|fee| fee.prioritization_fee);
+    let median_index = fees.len() / 2;
+
+    let median_priority_fee = if fees.len() % 2 == 0 {
+        (fees[median_index - 1].prioritization_fee + fees[median_index].prioritization_fee) / 2
+    } else {
+        fees[median_index].prioritization_fee
+    };
+
+    Ok(median_priority_fee)
+}
+
+fn prepend_compute_unit_ix(
+    instructions: Vec<Instruction>,
+    client: &RpcClient,
+    priority_fee: Option<u64>,
+) -> Result<Vec<Instruction>> {
+    let priority_fee = get_recommended_micro_lamport_fee(client, priority_fee)?;
+
+    if priority_fee > 0 {
+        let mut instructions_appended = instructions.clone();
+        instructions_appended.insert(
+            0,
+            ComputeBudgetInstruction::set_compute_unit_price(priority_fee),
+        );
+        Ok(instructions_appended)
+    } else {
+        Ok(instructions)
+    }
 }
 
 fn get_node_dns_option() -> Result<&'static str> {
